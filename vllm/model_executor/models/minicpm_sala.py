@@ -5,8 +5,9 @@
 # https://huggingface.co/openbmb/MiniCPM-SALA/blob/main/modeling_minicpm_sala.py
 # (OpenBMB, Apache-2.0)
 #
-# This adds the model with dense GQA for the "minicpm4" layers (NoPE); the
-# long-context InfLLM-V2 block-sparse backend is a planned follow-up PR.
+# The "minicpm4" layers use dense GQA (NoPE) by default, and transparently
+# switch to the InfLLM-V2 block-sparse backend for >= dense_len contexts when
+# the optional infllm_v2 package is installed (see minicpm_sala_sparse_wiring).
 """Inference-only MiniCPM-SALA model compatible with HuggingFace weights.
 
 Pinned reference: vllm-project/vllm @ 8cfeb84dba41a0c56570334757d921abd71e5288
@@ -102,6 +103,7 @@ from vllm.v1.attention.backends.linear_attn import LinearAttentionMetadata
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
 from .interfaces import HasInnerState, IsHybrid, SupportsPP
+from .minicpm_sala_sparse_wiring import create_sparse_attention_if_available
 
 logger = init_logger(__name__)
 
@@ -412,15 +414,30 @@ class MiniCPMSALADenseAttention(nn.Module):
                 prefix=f"{prefix}.o_gate",
             )
 
-        self.attn = Attention(
-            self.num_heads,
-            self.head_dim,
-            self.scaling,
+        # Prefer the InfLLM-V2 sparse backend when infllm_v2 is installed;
+        # otherwise fall back to the dense Attention path used below.
+        sparse_attn = create_sparse_attention_if_available(
+            config,
+            num_heads=self.num_heads,
+            head_dim=self.head_dim,
+            scaling=self.scaling,
             num_kv_heads=self.num_kv_heads,
             cache_config=cache_config,
             quant_config=quant_config,
             prefix=f"{prefix}.attn",
         )
+        if sparse_attn is not None:
+            self.attn = sparse_attn
+        else:
+            self.attn = Attention(
+                self.num_heads,
+                self.head_dim,
+                self.scaling,
+                num_kv_heads=self.num_kv_heads,
+                cache_config=cache_config,
+                quant_config=quant_config,
+                prefix=f"{prefix}.attn",
+            )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
